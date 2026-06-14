@@ -141,6 +141,7 @@ app = Dash(__name__,
                dbc.themes.CYBORG,
                'https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap'
            ])
+server = app.server  # Required for Render to detect the Flask server
 app.title = 'Smart Traffic — Hyderabad'
 
 total   = len(df)
