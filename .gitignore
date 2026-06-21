@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Database (auto-generated on first run)
+traffic_system.db
+
+# Environment variables (TomTom API key etc.)
+.env
+
+# Large model files (optional - remove this if you want to push model.pkl)
+# model.pkl
