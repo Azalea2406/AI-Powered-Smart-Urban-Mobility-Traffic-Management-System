@@ -1,27 +1,52 @@
 """
 app.py — AI-Powered Smart Urban Mobility & Traffic Management System
-Stanley College of Engineering and Technology for Women
+Now with: Authentication | Database | Live Data (TomTom API) | Alerts
 Run: python app.py  →  Open http://127.0.0.1:5000
 """
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
 import joblib, numpy as np, pandas as pd
-import os, json
+import os
+from functools import wraps
+
+import database as db
+import live_data
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'smart-traffic-hyd-dev-key-2026')
 
-# ── Load model & data ─────────────────────────────────────────────
+# ── Initialize database on startup ─────────────────────────────────
+db.init_db()
+
+# ── Load model ───────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 model = joblib.load(os.path.join(BASE_DIR, 'model.pkl'))
-df    = pd.read_csv(os.path.join(BASE_DIR, 'traffic_data.csv'), parse_dates=['timestamp'])
 
 FEATURES = ['hour','day_of_week','is_weekend','is_peak',
             'avg_speed_kmph','rolling_30m','rolling_1h','rolling_3h']
 LABELS   = {0: 'Low', 1: 'Medium', 2: 'High'}
-ROADS    = sorted(df['road_id'].unique().tolist())
 
-# ── Helper: corridor risk ──────────────────────────────────────────
-def get_corridors():
+ALERT_RISK_THRESHOLD = 70  # corridors above this score trigger an alert
+
+
+# ════════════════════════════════════════════════════════════════════
+#  AUTH HELPERS
+# ════════════════════════════════════════════════════════════════════
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def get_current_df():
+    """Always read fresh from DB (so live inserts show up immediately)."""
+    return db.get_all_traffic_records()
+
+
+def get_corridors(df):
     peak_df = df[df['is_peak'] == 1]
     if peak_df.empty:
         peak_df = df
@@ -36,6 +61,132 @@ def get_corridors():
         (stats['incident_count'] / max_incident if max_incident > 0 else 0) * 50
     ).round(1)
     return stats.sort_values('risk_score', ascending=False).head(10).to_dict(orient='records')
+
+
+def check_and_create_alerts(corridors):
+    """Generate alerts for any corridor crossing the risk threshold."""
+    new_alerts = []
+    for c in corridors:
+        if c['risk_score'] >= ALERT_RISK_THRESHOLD:
+            msg = f"{c['road_id'].replace('_',' ')} has crossed High Risk threshold (score: {c['risk_score']})"
+            db.create_alert(c['road_id'], 2, c['risk_score'], msg)
+            new_alerts.append(msg)
+    return new_alerts
+
+
+# ════════════════════════════════════════════════════════════════════
+#  LOGIN / SIGNUP PAGES
+# ════════════════════════════════════════════════════════════════════
+AUTH_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ 'Login' if mode == 'login' else 'Sign Up' }} — Smart Traffic</title>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&family=DM+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family:'DM Sans',sans-serif; background:#0a0e1a; color:#e2e8f0;
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+  }
+  .card {
+    background:#111827; border:1px solid #1e2d45; border-radius:16px;
+    padding:40px; width:380px; box-shadow:0 0 40px rgba(0,212,255,0.08);
+  }
+  h1 { font-family:'Rajdhani',sans-serif; color:#00d4ff; font-size:1.6rem; text-align:center; margin-bottom:6px; }
+  .sub { text-align:center; color:#64748b; font-size:0.8rem; margin-bottom:24px; }
+  label { display:block; font-size:0.72rem; color:#64748b; text-transform:uppercase; letter-spacing:0.8px; margin:14px 0 6px; }
+  input {
+    width:100%; background:#0a0e1a; border:1px solid #1e2d45; border-radius:8px;
+    color:#e2e8f0; padding:11px 14px; font-size:0.9rem;
+  }
+  input:focus { outline:none; border-color:#00d4ff; }
+  button {
+    width:100%; margin-top:22px; background:linear-gradient(135deg,#0066ff,#00d4ff);
+    color:#fff; border:none; border-radius:8px; padding:13px;
+    font-family:'Rajdhani',sans-serif; font-size:1.05rem; font-weight:700;
+    letter-spacing:1px; cursor:pointer;
+  }
+  .switch { text-align:center; margin-top:18px; font-size:0.82rem; color:#64748b; }
+  .switch a { color:#00d4ff; text-decoration:none; }
+  .error { background:rgba(255,82,82,0.1); border:1px solid #ff5252; color:#ff5252;
+           padding:10px 14px; border-radius:8px; font-size:0.82rem; margin-bottom:10px; }
+  .demo-note { background:rgba(0,212,255,0.08); border:1px solid #1e2d45; color:#64748b;
+               padding:10px 14px; border-radius:8px; font-size:0.75rem; margin-top:18px; text-align:center; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🚦 Smart Traffic</h1>
+  <div class="sub">Hyderabad Urban Mobility System</div>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="POST">
+    {% if mode == 'signup' %}
+    <label>Username</label>
+    <input type="text" name="username" required>
+    <label>Email</label>
+    <input type="email" name="email" required>
+    {% else %}
+    <label>Username</label>
+    <input type="text" name="username" required>
+    {% endif %}
+    <label>Password</label>
+    <input type="password" name="password" required>
+    <button type="submit">{{ 'Create Account' if mode == 'signup' else 'Login' }}</button>
+  </form>
+  <div class="switch">
+    {% if mode == 'login' %}
+      Don't have an account? <a href="/signup">Sign up</a>
+    {% else %}
+      Already have an account? <a href="/login">Login</a>
+    {% endif %}
+  </div>
+  <div class="demo-note">Demo credentials → admin / admin123</div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        user = db.verify_user(username, password)
+        if user:
+            session['user_id']  = user['id']
+            session['username'] = user['username']
+            session['role']     = user['role']
+            return redirect(url_for('index'))
+        error = "Invalid username or password"
+    return render_template_string(AUTH_HTML, mode='login', error=error)
+
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup_page():
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        email    = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+        if len(password) < 4:
+            error = "Password must be at least 4 characters"
+        else:
+            success, msg = db.create_user(username, email, password)
+            if success:
+                return redirect(url_for('login_page'))
+            error = msg
+    return render_template_string(AUTH_HTML, mode='signup', error=error)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login_page'))
+
 
 # ════════════════════════════════════════════════════════════════════
 #  MAIN DASHBOARD PAGE
@@ -60,218 +211,118 @@ DASHBOARD_HTML = """
     --red:      #ff5252;
     --text:     #e2e8f0;
     --muted:    #64748b;
-    --glow:     0 0 20px rgba(0,212,255,0.15);
   }
   * { margin:0; padding:0; box-sizing:border-box; }
-  body {
-    font-family: 'DM Sans', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-  }
+  body { font-family:'DM Sans',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
 
-  /* ── Header ── */
   header {
     background: linear-gradient(135deg, #0a0e1a 0%, #0d1f35 100%);
     border-bottom: 1px solid var(--border);
     padding: 18px 32px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between;
     position: sticky; top: 0; z-index: 100;
   }
-  header h1 {
-    font-family: 'Rajdhani', sans-serif;
-    font-size: 1.5rem; font-weight: 700;
-    color: var(--accent);
-    letter-spacing: 1px;
-  }
+  header h1 { font-family:'Rajdhani',sans-serif; font-size:1.5rem; font-weight:700; color:var(--accent); letter-spacing:1px; }
   header h1 span { color: var(--text); font-weight: 400; }
+  .header-right { display:flex; align-items:center; gap:16px; }
+  .user-chip {
+    display:flex; align-items:center; gap:8px;
+    background:#0d1626; border:1px solid var(--border); border-radius:20px;
+    padding:6px 14px; font-size:0.78rem; color:var(--text);
+  }
+  .user-chip a { color:var(--red); text-decoration:none; margin-left:8px; font-size:0.72rem; }
   .live-badge {
     display: flex; align-items: center; gap: 8px;
     font-size: 0.78rem; color: var(--green);
-    background: rgba(0,230,118,0.08);
-    border: 1px solid rgba(0,230,118,0.25);
+    background: rgba(0,230,118,0.08); border: 1px solid rgba(0,230,118,0.25);
     padding: 5px 12px; border-radius: 20px;
   }
-  .live-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--green);
-    animation: pulse 1.5s infinite;
-  }
-  @keyframes pulse {
-    0%,100% { opacity:1; transform:scale(1); }
-    50%      { opacity:0.4; transform:scale(1.3); }
-  }
+  .live-badge.fallback { color: var(--orange); background:rgba(255,171,64,0.08); border-color:rgba(255,171,64,0.25); }
+  .live-dot { width:8px; height:8px; border-radius:50%; background:currentColor; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1);} 50%{opacity:0.4;transform:scale(1.3);} }
 
-  /* ── Layout ── */
   main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
 
-  /* ── Stat Cards ── */
-  .stats-row {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 16px; margin-bottom: 24px;
+  /* Alert banner */
+  .alert-banner {
+    display:none;
+    background: rgba(255,82,82,0.08); border:1px solid var(--red); border-radius:10px;
+    padding:14px 20px; margin-bottom:20px; animation: fadeUp 0.4s ease;
   }
-  .stat-card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px 24px;
-    position: relative; overflow: hidden;
-    animation: fadeUp 0.5s ease both;
-  }
-  .stat-card::before {
-    content: '';
-    position: absolute; top: 0; left: 0;
-    width: 100%; height: 3px;
-  }
+  .alert-banner.show { display:block; }
+  .alert-title { font-family:'Rajdhani',sans-serif; color:var(--red); font-weight:700; font-size:0.95rem; margin-bottom:6px; }
+  .alert-item { font-size:0.82rem; color:var(--text); padding:3px 0; }
+
+  .stats-row { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:24px; }
+  .stat-card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:20px 24px; position:relative; overflow:hidden; animation:fadeUp 0.5s ease both; }
+  .stat-card::before { content:''; position:absolute; top:0; left:0; width:100%; height:3px; }
   .stat-card.blue::before  { background: var(--accent); }
   .stat-card.green::before { background: var(--green); }
   .stat-card.orange::before{ background: var(--orange); }
   .stat-card.red::before   { background: var(--red); }
-  .stat-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
-  .stat-value { font-family: 'Rajdhani', sans-serif; font-size: 2.2rem; font-weight: 700; margin: 4px 0; }
+  .stat-label { font-size:0.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:1px; }
+  .stat-value { font-family:'Rajdhani',sans-serif; font-size:2.2rem; font-weight:700; margin:4px 0; }
   .stat-card.blue   .stat-value { color: var(--accent); }
   .stat-card.green  .stat-value { color: var(--green); }
   .stat-card.orange .stat-value { color: var(--orange); }
   .stat-card.red    .stat-value { color: var(--red); }
-  .stat-sub { font-size: 0.78rem; color: var(--muted); }
+  .stat-sub { font-size:0.78rem; color:var(--muted); }
 
-  /* ── Grid ── */
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
-  .grid-3 { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 24px; }
+  .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:24px; }
+  .grid-3 { display:grid; grid-template-columns:2fr 1fr; gap:20px; margin-bottom:24px; }
 
-  /* ── Panel ── */
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px 24px;
-    animation: fadeUp 0.6s ease both;
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:20px 24px; animation:fadeUp 0.6s ease both; }
+  .panel-title { font-family:'Rajdhani',sans-serif; font-size:1rem; font-weight:600; color:var(--accent); text-transform:uppercase; letter-spacing:1px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .panel-title::before { content:''; width:3px; height:16px; background:var(--accent); border-radius:2px; }
+  .panel-title-left { display:flex; align-items:center; gap:8px; }
+  .refresh-btn {
+    background:#0d1626; border:1px solid var(--border); color:var(--accent);
+    border-radius:6px; padding:5px 12px; font-size:0.72rem; cursor:pointer;
+    font-family:'DM Sans',sans-serif;
   }
-  .panel-title {
-    font-family: 'Rajdhani', sans-serif;
-    font-size: 1rem; font-weight: 600;
-    color: var(--accent);
-    text-transform: uppercase; letter-spacing: 1px;
-    margin-bottom: 16px;
-    display: flex; align-items: center; gap: 8px;
-  }
-  .panel-title::before {
-    content: '';
-    width: 3px; height: 16px;
-    background: var(--accent);
-    border-radius: 2px;
-  }
+  .refresh-btn:hover { border-color:var(--accent); }
 
-  /* ── Chart containers ── */
-  .chart-wrap { position: relative; height: 240px; }
+  .chart-wrap { position:relative; height:240px; }
 
-  /* ── Predict Form ── */
-  .form-grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 14px;
-  }
-  .form-group label {
-    display: block;
-    font-size: 0.72rem; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 0.8px;
-    margin-bottom: 6px;
-  }
+  .form-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; }
+  .form-group label { display:block; font-size:0.72rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px; }
   .form-group input, .form-group select {
-    width: 100%;
-    background: #0a0e1a;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--text);
-    padding: 10px 14px;
-    font-family: 'DM Sans', sans-serif;
-    font-size: 0.9rem;
-    transition: border-color 0.2s;
+    width:100%; background:#0a0e1a; border:1px solid var(--border); border-radius:8px;
+    color:var(--text); padding:10px 14px; font-family:'DM Sans',sans-serif; font-size:0.9rem; transition:border-color 0.2s;
   }
-  .form-group input:focus, .form-group select:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(0,212,255,0.1);
-  }
-  .form-group select option { background: #111827; }
+  .form-group input:focus, .form-group select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(0,212,255,0.1); }
+  .form-group select option { background:#111827; }
 
   .predict-btn {
-    width: 100%; margin-top: 16px;
-    background: linear-gradient(135deg, #0066ff, #00d4ff);
-    color: #fff;
-    border: none; border-radius: 8px;
-    padding: 13px;
-    font-family: 'Rajdhani', sans-serif;
-    font-size: 1.05rem; font-weight: 700;
-    letter-spacing: 1px;
-    cursor: pointer;
-    transition: transform 0.15s, box-shadow 0.15s;
+    width:100%; margin-top:16px; background:linear-gradient(135deg,#0066ff,#00d4ff);
+    color:#fff; border:none; border-radius:8px; padding:13px;
+    font-family:'Rajdhani',sans-serif; font-size:1.05rem; font-weight:700; letter-spacing:1px; cursor:pointer;
+    transition:transform 0.15s, box-shadow 0.15s;
   }
-  .predict-btn:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 20px rgba(0,212,255,0.3);
-  }
-  .predict-btn:active { transform: translateY(0); }
+  .predict-btn:hover { transform:translateY(-1px); box-shadow:0 6px 20px rgba(0,212,255,0.3); }
 
-  /* ── Result Box ── */
-  #result-box {
-    margin-top: 16px;
-    border-radius: 10px;
-    padding: 18px 20px;
-    display: none;
-    border: 1px solid;
-    animation: fadeUp 0.3s ease;
-  }
-  #result-box.low    { background: rgba(0,230,118,0.08); border-color: var(--green); }
-  #result-box.medium { background: rgba(255,171,64,0.08); border-color: var(--orange); }
-  #result-box.high   { background: rgba(255,82,82,0.08);  border-color: var(--red); }
-  .result-level {
-    font-family: 'Rajdhani', sans-serif;
-    font-size: 1.8rem; font-weight: 700;
-  }
+  #result-box { margin-top:16px; border-radius:10px; padding:18px 20px; display:none; border:1px solid; animation:fadeUp 0.3s ease; }
+  #result-box.low    { background:rgba(0,230,118,0.08); border-color:var(--green); }
+  #result-box.medium { background:rgba(255,171,64,0.08); border-color:var(--orange); }
+  #result-box.high   { background:rgba(255,82,82,0.08);  border-color:var(--red); }
+  .result-level { font-family:'Rajdhani',sans-serif; font-size:1.8rem; font-weight:700; }
   .result-low    { color: var(--green); }
   .result-medium { color: var(--orange); }
   .result-high   { color: var(--red); }
-  .result-conf { font-size: 0.85rem; color: var(--muted); margin-top: 4px; }
+  .result-conf { font-size:0.85rem; color:var(--muted); margin-top:4px; }
 
-  /* ── Corridor Table ── */
-  .corridor-row {
-    display: grid;
-    grid-template-columns: 1fr 80px 90px;
-    gap: 10px;
-    padding: 10px 0;
-    border-bottom: 1px solid var(--border);
-    align-items: center;
-    font-size: 0.88rem;
-  }
-  .corridor-row:last-child { border-bottom: none; }
-  .corridor-name { color: var(--text); }
-  .risk-bar-wrap { background: #1a2540; border-radius: 4px; height: 6px; overflow: hidden; }
-  .risk-bar { height: 100%; border-radius: 4px; transition: width 0.8s ease; }
-  .badge {
-    font-size: 0.7rem; font-weight: 600;
-    padding: 3px 8px; border-radius: 4px;
-    text-align: center; text-transform: uppercase;
-  }
-  .badge-high   { background: rgba(255,82,82,0.15);  color: var(--red);    border: 1px solid rgba(255,82,82,0.3); }
-  .badge-medium { background: rgba(255,171,64,0.15); color: var(--orange); border: 1px solid rgba(255,171,64,0.3); }
-  .badge-low    { background: rgba(0,230,118,0.15);  color: var(--green);  border: 1px solid rgba(0,230,118,0.3); }
+  .corridor-row { display:grid; grid-template-columns:1fr 80px 90px; gap:10px; padding:10px 0; border-bottom:1px solid var(--border); align-items:center; font-size:0.88rem; }
+  .corridor-row:last-child { border-bottom:none; }
+  .risk-bar-wrap { background:#1a2540; border-radius:4px; height:6px; overflow:hidden; }
+  .risk-bar { height:100%; border-radius:4px; transition:width 0.8s ease; }
+  .badge { font-size:0.7rem; font-weight:600; padding:3px 8px; border-radius:4px; text-align:center; text-transform:uppercase; }
+  .badge-high   { background:rgba(255,82,82,0.15);  color:var(--red);    border:1px solid rgba(255,82,82,0.3); }
+  .badge-medium { background:rgba(255,171,64,0.15); color:var(--orange); border:1px solid rgba(255,171,64,0.3); }
+  .badge-low    { background:rgba(0,230,118,0.15);  color:var(--green);  border:1px solid rgba(0,230,118,0.3); }
 
-  @keyframes fadeUp {
-    from { opacity:0; transform:translateY(16px); }
-    to   { opacity:1; transform:translateY(0); }
-  }
+  @keyframes fadeUp { from{opacity:0;transform:translateY(16px);} to{opacity:1;transform:translateY(0);} }
 
-  /* ── Footer ── */
-  footer {
-    text-align: center; padding: 20px;
-    color: var(--muted); font-size: 0.75rem;
-    border-top: 1px solid var(--border);
-    margin-top: 8px;
-  }
+  footer { text-align:center; padding:20px; color:var(--muted); font-size:0.75rem; border-top:1px solid var(--border); margin-top:8px; }
 </style>
 </head>
 <body>
@@ -282,12 +333,19 @@ DASHBOARD_HTML = """
     Stanley College of Engineering & Technology for Women<br>
     <span style="color:var(--accent);">AI-Powered Urban Mobility System</span>
   </div>
-  <div class="live-badge"><div class="live-dot"></div> System Online</div>
+  <div class="header-right">
+    <div class="live-badge" id="live-status-badge"><div class="live-dot"></div> <span id="live-status-text">Checking...</span></div>
+    <div class="user-chip">👤 {{ username }} <a href="/logout">Logout</a></div>
+  </div>
 </header>
 
 <main>
 
-  <!-- STAT CARDS -->
+  <div class="alert-banner" id="alert-banner">
+    <div class="alert-title">🔔 Active Alerts — High Risk Corridors</div>
+    <div id="alert-list"></div>
+  </div>
+
   <div class="stats-row" id="stat-cards">
     <div class="stat-card blue">
       <div class="stat-label">Total Records</div>
@@ -297,21 +355,20 @@ DASHBOARD_HTML = """
     <div class="stat-card green">
       <div class="stat-label">Low Congestion</div>
       <div class="stat-value" id="s-low">—</div>
-      <div class="stat-sub">vehicle count &lt; 200</div>
+      <div class="stat-sub">vehicle count low</div>
     </div>
     <div class="stat-card orange">
       <div class="stat-label">Medium Congestion</div>
       <div class="stat-value" id="s-med">—</div>
-      <div class="stat-sub">200 – 400 vehicles</div>
+      <div class="stat-sub">moderate traffic</div>
     </div>
     <div class="stat-card red">
       <div class="stat-label">High Congestion</div>
       <div class="stat-value" id="s-high">—</div>
-      <div class="stat-sub">vehicle count &gt; 400</div>
+      <div class="stat-sub">heavy traffic</div>
     </div>
   </div>
 
-  <!-- CHARTS ROW -->
   <div class="grid-2">
     <div class="panel">
       <div class="panel-title">Hourly Traffic Density</div>
@@ -323,16 +380,16 @@ DASHBOARD_HTML = """
     </div>
   </div>
 
-  <!-- CORRIDORS + PREDICT -->
   <div class="grid-3">
 
-    <!-- Corridor Risk Table -->
     <div class="panel">
-      <div class="panel-title">High-Risk Corridors (Peak Hours)</div>
+      <div class="panel-title">
+        <div class="panel-title-left">High-Risk Corridors (Peak Hours)</div>
+        <button class="refresh-btn" onclick="fetchLiveData()">🔄 Fetch Live Data</button>
+      </div>
       <div id="corridor-list"></div>
     </div>
 
-    <!-- Live Predictor -->
     <div class="panel">
       <div class="panel-title">Live Predictor</div>
       <div class="form-grid">
@@ -387,76 +444,81 @@ DASHBOARD_HTML = """
 </footer>
 
 <script>
-// ── Fetch analytics & populate ────────────────────────────────────
 async function loadDashboard() {
   const res  = await fetch('/analytics');
   const data = await res.json();
 
-  // Stat cards
   document.getElementById('s-total').textContent = data.total_records;
   document.getElementById('s-low').textContent   = data.low_pct  + '%';
   document.getElementById('s-med').textContent   = data.med_pct  + '%';
   document.getElementById('s-high').textContent  = data.high_pct + '%';
 
-  // Hourly bar chart
   const hours  = data.hourly.map(r => r.hour);
   const counts = data.hourly.map(r => r.avg_count.toFixed(1));
-  const barColors = hours.map(h =>
-    [8,9,17,18,19].includes(h) ? '#ff5252' : '#00d4ff'
-  );
+  const barColors = hours.map(h => [8,9,17,18,19].includes(h) ? '#ff5252' : '#00d4ff');
 
   new Chart(document.getElementById('hourlyChart'), {
     type: 'bar',
-    data: {
-      labels: hours,
-      datasets: [{ data: counts, backgroundColor: barColors, borderRadius: 4, borderSkipped: false }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color:'#64748b', font:{size:10} }, grid: { color:'#1e2d45' } },
-        y: { ticks: { color:'#64748b', font:{size:10} }, grid: { color:'#1e2d45' } }
-      }
-    }
+    data: { labels: hours, datasets: [{ data: counts, backgroundColor: barColors, borderRadius: 4, borderSkipped: false }] },
+    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+      scales: { x:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1e2d45'}}, y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1e2d45'}} } }
   });
 
-  // Pie chart
   new Chart(document.getElementById('pieChart'), {
     type: 'doughnut',
-    data: {
-      labels: ['Low','Medium','High'],
-      datasets: [{ data: [data.low_pct, data.med_pct, data.high_pct],
-        backgroundColor: ['#00e676','#ffab40','#ff5252'],
-        borderWidth: 0, hoverOffset: 8 }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: {
-        legend: { position:'bottom', labels:{ color:'#e2e8f0', padding:16, font:{size:12} } }
-      },
-      cutout: '65%'
-    }
+    data: { labels:['Low','Medium','High'], datasets:[{ data:[data.low_pct,data.med_pct,data.high_pct], backgroundColor:['#00e676','#ffab40','#ff5252'], borderWidth:0, hoverOffset:8 }] },
+    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom',labels:{color:'#e2e8f0',padding:16,font:{size:12}}}}, cutout:'65%' }
   });
 
-  // Corridors
+  renderCorridors(data.corridors);
+  renderAlerts(data.alerts);
+
+  const badge = document.getElementById('live-status-badge');
+  const text  = document.getElementById('live-status-text');
+  if (data.live_api_active) {
+    badge.classList.remove('fallback'); text.textContent = 'Live API Connected';
+  } else {
+    badge.classList.add('fallback'); text.textContent = 'Historical Data Mode';
+  }
+}
+
+function renderCorridors(corridors) {
   const list = document.getElementById('corridor-list');
-  data.corridors.forEach(c => {
-    const score  = c.risk_score;
-    const cls    = score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low';
-    const color  = score >= 70 ? '#ff5252' : score >= 40 ? '#ffab40' : '#00e676';
+  list.innerHTML = '';
+  corridors.forEach(c => {
+    const score = c.risk_score;
+    const cls   = score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low';
+    const color = score >= 70 ? '#ff5252' : score >= 40 ? '#ffab40' : '#00e676';
     list.innerHTML += `
       <div class="corridor-row">
         <div class="corridor-name">${c.road_id.replace(/_/g,' ')}</div>
-        <div class="risk-bar-wrap">
-          <div class="risk-bar" style="width:${score}%;background:${color}"></div>
-        </div>
+        <div class="risk-bar-wrap"><div class="risk-bar" style="width:${score}%;background:${color}"></div></div>
         <div class="badge badge-${cls}">${cls} ${score}</div>
       </div>`;
   });
 }
 
-// ── Predict ───────────────────────────────────────────────────────
+function renderAlerts(alerts) {
+  const banner = document.getElementById('alert-banner');
+  const list = document.getElementById('alert-list');
+  if (alerts && alerts.length > 0) {
+    banner.classList.add('show');
+    list.innerHTML = alerts.map(a => `<div class="alert-item">⚠️ ${a.message}</div>`).join('');
+  } else {
+    banner.classList.remove('show');
+  }
+}
+
+async function fetchLiveData() {
+  const btn = event.target;
+  btn.textContent = '⏳ Fetching...';
+  const res = await fetch('/live-fetch', { method: 'POST' });
+  const data = await res.json();
+  btn.textContent = '🔄 Fetch Live Data';
+  alert(data.message);
+  loadDashboard();
+}
+
 async function predict() {
   const hour       = parseInt(document.getElementById('f-hour').value);
   const day_of_week= parseInt(document.getElementById('f-day').value);
@@ -498,18 +560,20 @@ loadDashboard();
 # ════════════════════════════════════════════════════════════════════
 
 @app.route('/')
+@login_required
 def index():
-    return render_template_string(DASHBOARD_HTML)
+    return render_template_string(DASHBOARD_HTML, username=session.get('username', 'User'))
 
 
 @app.route('/predict', methods=['POST'])
+@login_required
 def predict():
     data = request.get_json()
     row  = [[data[f] for f in FEATURES]]
     pred = model.predict(row)[0]
     prob = model.predict_proba(row)[0]
 
-    # Suggest most congested road at that hour
+    df = get_current_df()
     hour = data.get('hour', 0)
     road_df = df[df['hour'] == hour] if not df[df['hour'] == hour].empty else df
     suggested = road_df.loc[road_df['vehicle_count'].idxmax(), 'road_id']
@@ -522,17 +586,24 @@ def predict():
 
 
 @app.route('/analytics', methods=['GET'])
+@login_required
 def analytics():
-    # Hourly averages
+    df = get_current_df()
+
     hourly = df.groupby('hour')['vehicle_count'].mean().reset_index()
     hourly.columns = ['hour', 'avg_count']
 
-    # Congestion distribution
     total  = len(df)
     counts = df['congestion_level'].value_counts()
     low_pct  = round(counts.get(0, 0) / total * 100, 1)
     med_pct  = round(counts.get(1, 0) / total * 100, 1)
     high_pct = round(counts.get(2, 0) / total * 100, 1)
+
+    corridors = get_corridors(df)
+    check_and_create_alerts(corridors)
+    alerts = db.get_recent_alerts(limit=5)
+
+    live_active = (df['source'] == 'live_tomtom').any() if 'source' in df.columns else False
 
     return jsonify({
         'total_records': total,
@@ -540,19 +611,44 @@ def analytics():
         'med_pct':  med_pct,
         'high_pct': high_pct,
         'hourly':   hourly.to_dict(orient='records'),
-        'corridors': get_corridors()
+        'corridors': corridors,
+        'alerts': alerts,
+        'live_api_active': bool(live_active)
     })
 
 
+@app.route('/live-fetch', methods=['POST'])
+@login_required
+def live_fetch():
+    """Manually trigger a live data fetch from TomTom (with fallback)."""
+    try:
+        df_live, status = live_data.fetch_all_roads_live()
+        for _, row in df_live.iterrows():
+            db.insert_live_record(row.to_dict())
+        return jsonify({'success': True, 'message': f'{status} — {len(df_live)} roads updated'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+
 @app.route('/heatmap', methods=['GET'])
+@login_required
 def heatmap():
+    df = get_current_df()
     sample = df[['road_id','latitude','longitude','congestion_level']].dropna()
     return jsonify(sample.to_dict(orient='records'))
 
 
 @app.route('/risk', methods=['GET'])
+@login_required
 def risk():
-    return jsonify(get_corridors())
+    df = get_current_df()
+    return jsonify(get_corridors(df))
+
+
+@app.route('/alerts', methods=['GET'])
+@login_required
+def alerts_endpoint():
+    return jsonify(db.get_recent_alerts(limit=20))
 
 
 if __name__ == '__main__':
@@ -560,13 +656,10 @@ if __name__ == '__main__':
     print("  🚦 Smart Traffic Management System")
     print("  Stanley College of Engineering — Hyderabad")
     print("="*55)
+    print("  ✅ Database initialized")
     print("  ✅ Model loaded")
-    print(f"  ✅ Dataset loaded — {len(df)} records")
+    print(f"  ✅ TomTom Live API: {'Configured' if live_data.is_api_available() else 'Not configured (fallback mode)'}")
     print("  🌐 Dashboard → http://127.0.0.1:5000")
-    print("  📡 API Endpoints:")
-    print("     POST /predict   — congestion prediction")
-    print("     GET  /analytics — hourly stats + corridors")
-    print("     GET  /heatmap   — GPS + congestion data")
-    print("     GET  /risk      — top 10 risk corridors")
+    print("  🔐 Login → username: admin | password: admin123")
     print("="*55 + "\n")
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
